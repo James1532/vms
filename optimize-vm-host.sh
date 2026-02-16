@@ -19,20 +19,24 @@ fi
 
 SYSCTL_FILE="/etc/sysctl.d/99-vm-host-tuning.conf"
 
-echo "[1/5] Optimizing CPU Governor..."
+echo "[1/6] Installing helper packages (best-effort)..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y >/dev/null 2>&1 || true
+apt-get install -y cpufrequtils >/dev/null 2>&1 || true
+
+echo ""
+echo "[2/6] Optimizing CPU Governor..."
 if [ -d /sys/devices/system/cpu/cpu0/cpufreq ]; then
   for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
     echo "performance" > "${gov}" 2>/dev/null || true
   done
 
-  # Persist best-effort
-  if command -v apt >/dev/null 2>&1; then
-    apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y cpufrequtils >/dev/null 2>&1 || true
-  fi
-  echo 'GOVERNOR="performance"' > /etc/default/cpufrequtils 2>/dev/null || true
-  systemctl disable ondemand 2>/dev/null || true
-  systemctl enable cpufrequtils 2>/dev/null || true
+  # Persist via cpufrequtils
+  cat > /etc/default/cpufrequtils << 'EOF'
+GOVERNOR="performance"
+EOF
+  systemctl enable cpufrequtils >/dev/null 2>&1 || true
+  systemctl restart cpufrequtils >/dev/null 2>&1 || true
 
   GOVERNOR="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "N/A")"
   echo "   ✓ CPU Governor: ${GOVERNOR}"
@@ -41,9 +45,9 @@ else
 fi
 
 echo ""
-echo "[2/5] Configuring Memory Management..."
+echo "[3/6] Configuring sysctl tuning..."
 
-# Write tuning to a dedicated sysctl.d file (avoids appending duplicates to sysctl.conf)
+# Write tuning to a dedicated sysctl.d file (avoids duplicates in sysctl.conf)
 cat > "${SYSCTL_FILE}" << 'EOF'
 # VM Hosting Optimizations (KVM/QEMU)
 vm.swappiness=10
@@ -53,13 +57,17 @@ vm.vfs_cache_pressure=50
 vm.overcommit_memory=0
 vm.min_free_kbytes=131072
 
-# Network Performance Tuning (host stack)
+# Network tuning (host stack)
 net.core.netdev_max_backlog=5000
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.ipv4.tcp_mtu_probing=1
 net.ipv4.tcp_slow_start_after_idle=0
 EOF
+
+# Ensure BBR module loads at boot
+mkdir -p /etc/modules-load.d
+echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
 
 # Apply now
 sysctl --system >/dev/null 2>&1 || true
@@ -69,12 +77,13 @@ echo "   ✓ Dirty ratio: $(sysctl -n vm.dirty_ratio 2>/dev/null || echo N/A)%"
 echo "   ✓ VFS cache pressure: $(sysctl -n vm.vfs_cache_pressure 2>/dev/null || echo N/A)"
 echo "   ✓ Overcommit memory: $(sysctl -n vm.overcommit_memory 2>/dev/null || echo N/A)"
 echo "   ✓ Min free kbytes: $(sysctl -n vm.min_free_kbytes 2>/dev/null || echo N/A)"
+echo "   ✓ TCP CC: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo N/A)"
 
 echo ""
-echo "[3/5] Configuring Transparent Hugepages..."
+echo "[4/6] Configuring Transparent Hugepages..."
 
 if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
-  # Recommended for mixed VPS hosting: avoid compaction latency spikes
+  # Recommended for mixed VPS hosting
   echo madvise > /sys/kernel/mm/transparent_hugepage/enabled || true
   echo never   > /sys/kernel/mm/transparent_hugepage/defrag  || true
 
@@ -104,48 +113,49 @@ else
 fi
 
 echo ""
-echo "[4/5] Optimizing Disk Schedulers (NVMe and SATA SSD)..."
+echo "[5/6] Persisting disk schedulers (NVMe and SATA SSD) via udev..."
 
-# NVMe: prefer 'none'
+cat > /etc/udev/rules.d/60-io-schedulers.rules << 'EOF'
+# NVMe: use none
+ACTION=="add|change", KERNEL=="nvme*n1", ATTR{queue/scheduler}="none"
+
+# SATA/SAS: use mq-deadline (kernel will keep default if unsupported)
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/scheduler}="mq-deadline"
+EOF
+
+udevadm control --reload-rules >/dev/null 2>&1 || true
+udevadm trigger >/dev/null 2>&1 || true
+
+# Apply immediately best-effort
 for dev in /sys/block/nvme*n1/queue/scheduler; do
   [ -e "$dev" ] || continue
   if grep -q '\<none\>' "$dev"; then
     echo none > "$dev" 2>/dev/null || true
-    echo "   ✓ $(basename "$(dirname "$(dirname "$dev")")"): scheduler set to none"
   fi
 done
 
-# SATA/SAS SSD: prefer mq-deadline if available, else leave as-is
 for dev in /sys/block/sd*/queue/scheduler; do
   [ -e "$dev" ] || continue
   if grep -q '\<mq-deadline\>' "$dev"; then
     echo mq-deadline > "$dev" 2>/dev/null || true
-    echo "   ✓ $(basename "$(dirname "$(dirname "$dev")")"): scheduler set to mq-deadline"
   fi
 done
 
+echo "   ✓ udev rule: /etc/udev/rules.d/60-io-schedulers.rules"
+
 echo ""
-echo "[5/5] Verifying Configuration..."
+echo "[6/6] Verifying..."
 
 sysctl --system >/dev/null 2>&1 || true
-
-CC="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo N/A)"
-QDISC="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo N/A)"
-echo "   ✓ TCP Congestion Control: ${CC}"
-echo "   ✓ Default qdisc: ${QDISC}"
 echo "   ✓ Sysctl file: ${SYSCTL_FILE}"
+echo "   ✓ THP service: configure-thp.service (enabled if present)"
 
 echo ""
 echo "=========================================="
 echo "✓ Optimization Complete!"
 echo "=========================================="
 echo ""
-echo "Applied Optimizations:"
-echo "  • CPU: Performance governor enabled (best-effort persist)"
-echo "  • Memory: Swappiness=10, min_free_kbytes=131072, overcommit_memory=0"
-echo "  • THP: enabled=madvise, defrag=never"
-echo "  • Network: BBR + fq (host stack)"
-echo "  • Disk: NVMe scheduler=none, SATA scheduler=mq-deadline (when available)"
-echo ""
-echo "Most changes persist across reboots via sysctl.d and systemd service."
+echo "Notes:"
+echo "  • Reboot is recommended once to confirm CPU governor + udev scheduler rules apply at boot"
+echo "  • These are host-level defaults intended for mixed KVM VPS workloads"
 echo ""
